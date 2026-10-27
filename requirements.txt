@@ -1,0 +1,6 @@
+pyTelegramBotAPI>=4.14
+requests>=2.31
+# Optional: needed only for image charts / reports
+matplotlib>=3.7
+Pillow>=10.0
+arabic-reshaper>=3.0

@@ -1,0 +1,25 @@
+[Unit]
+Description=ATRON - PasarGuard Panel Manager Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atron
+Group=atron
+WorkingDirectory=/opt/atron
+EnvironmentFile=/opt/atron/.env
+Environment=DATA_DIR=/opt/atron/data
+ExecStart=/opt/atron/venv/bin/python /opt/atron/bot.py
+Restart=always
+RestartSec=5
+
+# hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/atron/data
+
+[Install]
+WantedBy=multi-user.target

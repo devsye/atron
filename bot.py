@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """ATRON (آترون) - a Telegram bot for managing PasarGuard panels.
 
-Version 1.0 (first public release - more updates coming)
+Version 1.1 (report group hub)
 Author: SYE - https://github.com/devsye
 License: MIT
 
@@ -11,7 +11,7 @@ Configuration (environment variables, or a config.json inside DATA_DIR):
   DATA_DIR    where runtime data is stored (default: ./data)
   CHART_LANG  "en" (default) or "fa" for chart labels
 """
-import json, os, io, csv, time, uuid, html, random, threading, datetime, re, base64
+import json, os, io, csv, time, uuid, html, random, threading, datetime, re, base64, queue
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 import requests, urllib3
@@ -55,6 +55,7 @@ TRASH_DAYS = 7
 tlock = threading.RLock()
 lock = threading.Lock()
 tokens, CACHE, ST, LAST = {}, {}, {}, {}
+_TL = threading.local()  # routes bot.send_* into a forum topic (report group hub)
 
 SE = {"active": "🟢", "disabled": "🚫", "expired": "⏳", "limited": "📦", "on_hold": "⏸"}
 
@@ -167,6 +168,10 @@ def _wrap_send(name, tpos):
         for key in ("text", "caption"):
             if isinstance(k.get(key), str):
                 k[key] = tr(k[key])
+        if name in ("send_message", "send_photo", "send_document") and getattr(_TL, "tid", None) \
+                and "message_thread_id" not in k:
+            if (a[0] if a else k.get("chat_id")) == _TL.chat:
+                k["message_thread_id"] = _TL.tid
         return f(*a, **k)
     setattr(bot, name, w)
 
@@ -602,6 +607,16 @@ EN_PAIRS = [
     ('برگشت', 'Back'),
     ('🔙 منو', '🔙 Menu'),
 ]
+EN_PAIRS += [
+    ('🛰 گروه گزارش', '🛰 Report group'), ('گروه گزارش', 'Report group'),
+    ('📊 گزارش کلی', '📊 Overview'), ('📈 نمودارها', '📈 Charts'), ('💾 بکاپ پنل‌ها', '💾 Panel backups'),
+    ('👥 خروجی کاربران', '👥 Users export'), ('🏆 پرمصرف‌ها', '🏆 Top users'), ('🩺 وضعیت پنل‌ها', '🩺 Panel status'),
+    ('🔔 هشدارها', '🔔 Alerts'), ('🗑 سطل زباله', '🗑 Trash'), ('🔀 مهاجرت', '🔀 Migration'),
+    ('🛠 لاگ عملیات', '🛠 Operations log'), ('💾 بکاپ کامل', '💾 Full backup'),
+    ('📤 ارسال همین الان', '📤 Send now'), ('⏱ زمان‌بندی', '⏱ Schedule'), ('خاموش', 'Off'),
+    ('تاپیک فعال است.', 'Topic is active.'), ('🔧 بازبینی / ساخت دوباره‌ی تاپیک‌ها', '🔧 Check / rebuild topics'),
+    ('🆔 ثبت دستی آیدی گروه', '🆔 Set group ID manually'), ('🗑 قطع اتصال', '🗑 Disconnect'),
+]
 _build_tr()
 
 
@@ -784,9 +799,24 @@ def u_get(p, name):
     return req(p, "GET", f"/api/user/{name}")
 
 
+def _ops_desc(body):
+    out = []
+    if body.get("status"):
+        out.append({"active": "فعال شد", "disabled": "غیرفعال شد"}.get(body["status"], body["status"]))
+    if "data_limit" in body:
+        out.append("حجم → " + (fmt_bytes(body["data_limit"]) if body["data_limit"] else "نامحدود"))
+    if "expire" in body:
+        out.append("انقضا → " + (fdate(body["expire"]) if body["expire"] else "نامحدود"))
+    if "note" in body:
+        out.append("یادداشت")
+    return "، ".join(out) or "ویرایش"
+
+
 def u_modify(p, name, body):
     CACHE.pop(p["id"], None)
-    return req(p, "PUT", f"/api/user/{name}", body=body)
+    r = req(p, "PUT", f"/api/user/{name}", body=body)
+    hub_event("ops", f"✏️ {esc(host(p))} · <code>{esc(name)}</code>: {_ops_desc(body)}")
+    return r
 
 
 def trash_all():
@@ -839,10 +869,12 @@ def u_delete(p, name, raw=None):
         raw = u_get(p, name)
     trash_add(p["id"], raw)
     try:
-        return req(p, "DELETE", f"/api/user/{name}")
+        r = req(p, "DELETE", f"/api/user/{name}")
     except Exception:
         trash_remove(p["id"], name)
         raise
+    hub_event("trash", f"🗑 {esc(host(p))} · <code>{esc(name)}</code> حذف شد (تا {TRASH_DAYS} روز در سطل زباله)")
+    return r
 
 
 def trash_restore(p, name):
@@ -877,16 +909,21 @@ def trash_restore(p, name):
         req(p, "POST", "/api/user", body=body)
     CACHE.pop(p["id"], None)
     trash_remove(p["id"], name)
+    hub_event("trash", f"♻️ {esc(host(p))} · <code>{esc(name)}</code> از سطل زباله بازگردانی شد")
 
 
 def u_reset(p, name):
     CACHE.pop(p["id"], None)
-    return req(p, "POST", f"/api/user/{name}/reset")
+    r = req(p, "POST", f"/api/user/{name}/reset")
+    hub_event("ops", f"♻️ {esc(host(p))} · <code>{esc(name)}</code>: ریست مصرف")
+    return r
 
 
 def u_revoke(p, name):
     CACHE.pop(p["id"], None)
-    return req(p, "POST", f"/api/user/{name}/revoke_sub")
+    r = req(p, "POST", f"/api/user/{name}/revoke_sub")
+    hub_event("ops", f"🔑 {esc(host(p))} · <code>{esc(name)}</code>: ریوک ساب")
+    return r
 
 
 def body_extend(x, days):
@@ -999,6 +1036,7 @@ HELP = ("📖 <b>راهنما</b>\n\n"
         "• 📈 نمودار مصرف: روند مصرف در بازه‌های ۲۴ساعت/۷/۳۰/۹۰ روز، پرمصرف‌ها، وضعیت، انقضا، فعالیت، فروش، سلامت؛ "
         "خروجی داشبورد کامل (یک عکس) یا گالری نمودارها\n"
         "• 🔀 مهاجرت: با لینک سابسکریپشن (تکی/گروهی) یا پنل به پنل (انتخابی)، با تاریخچه و بازگردانی\n"
+        "• 🛰 گروه گزارش: گزارش/بکاپ/نمودار/هشدار همه‌ی پنل‌ها در ۱۰ تاپیک یک گروه (ربات را ادمین گروه کن)\n"
         "• هشدار خودکار: هر ۳۰ دقیقه کاربران نزدیک اتمام/انقضا و قطعی پنل را اطلاع می‌دهد\n\n"
         "آنلاین = فعالیت در ۳ دقیقه اخیر. لغو هر مرحله: /cancel")
 
@@ -1007,7 +1045,7 @@ def main_kb():
     kb = types.InlineKeyboardMarkup(row_width=2)
     kb.add(BM("📋 پنل‌های من", callback_data="pl"), BM("🔀 مهاجرت", callback_data="MG"))
     kb.add(BM("📊 گزارش کلی", callback_data="ov"), BM("🌍 زبان", callback_data="lg"))
-    kb.add(BM("📖 راهنما", callback_data="help"))
+    kb.add(BM("🛰 گروه گزارش", callback_data="HB"), BM("📖 راهنما", callback_data="help"))
     return kb
 
 
@@ -1184,6 +1222,7 @@ def do_create(chat, gids):
     except Exception as e:
         bot.send_message(chat, f"❌ ساخت کاربر ناموفق:\n<code>{esc(e)}</code>", reply_markup=back_kb(f"p:{p['id']}", "🔙 پنل"))
         return
+    hub_event("ops", f"➕ {esc(host(p))} · <code>{esc(st['username'])}</code>: کاربر ساخته شد")
     text, kb = user_view(p, st["username"])
     bot.send_message(chat, "✅ کاربر ساخته شد\n\n" + text, reply_markup=kb)
     try:
@@ -1194,7 +1233,7 @@ def do_create(chat, gids):
         pass
 
 
-@bot.message_handler(commands=["start"], func=lambda m: m.from_user.id == OWNER)
+@bot.message_handler(commands=["start"], func=lambda m: m.from_user.id == OWNER and m.chat.type == "private")
 def start(m):
     ST.pop(m.chat.id, None)
     try:
@@ -1205,7 +1244,7 @@ def start(m):
     bot.send_message(m.chat.id, MENU_TXT, reply_markup=main_kb())
 
 
-@bot.message_handler(content_types=["text"], func=lambda m: m.from_user.id == OWNER)
+@bot.message_handler(content_types=["text"], func=lambda m: m.from_user.id == OWNER and m.chat.type == "private")
 def on_text(m):
     chat = m.chat.id
     t = (m.text or "").strip()
@@ -1238,6 +1277,7 @@ def on_text(m):
             ps = load()
             ps.append(p)
             save(ps)
+            hub_event("ops", f"➕ پنل جدید ثبت شد: <b>{esc(host(p))}</b>")
             if st.get("after") == "mig":
                 edit(w, "✅ پنل ذخیره شد.")
                 return mig_after_add(chat, p)
@@ -1253,6 +1293,12 @@ def on_text(m):
             kb.add(B("🔍 جستجوی جدید", callback_data=f"SR:{p['id']}"), B("🔙 پنل", callback_data=f"p:{p['id']}"))
             bot.send_message(chat, f"🔍 نتیجه «{esc(t)}»: {len(xs)} کاربر\n\n" +
                              "\n".join(line(i, x, "all") for i, x in enumerate(xs, 1)), reply_markup=kb)
+        elif step == "hub_id":
+            gid = int(t.replace(" ", ""))
+            ST.pop(chat, None)
+            w = bot.send_message(chat, "⏳ در حال اتصال به گروه...")
+            ok, text = hub_setup(gid)
+            edit(w, "🛰 " + text, back_kb("HB", "🔙 گروه گزارش"))
         elif step == "mig_links":
             ST.pop(chat, None)
             mig_analyze_links(chat, t)
@@ -2105,7 +2151,7 @@ def export(p, chat):
     rows = users_all(p, True)
     stamp = time.strftime("%Y%m%d-%H%M")
     bot.send_document(chat, io.BytesIO(json.dumps(rows, ensure_ascii=False, indent=1).encode()),
-                      visible_file_name=f"users-{stamp}.json", caption="📤 بکاپ کامل (JSON)")
+                      visible_file_name=f"users-{host(p).replace(':', '_')}-{stamp}.json", caption=f"📤 بکاپ کامل (JSON) — {host(p)}")
     s = io.StringIO()
     w = csv.writer(s)
     w.writerow(["username", "status", "used_bytes", "limit_bytes", "expire", "online_at", "note", "sub_url"])
@@ -2113,7 +2159,7 @@ def export(p, chat):
         w.writerow([u.get("username"), u.get("status"), u.get("used_traffic"), u.get("data_limit"),
                     u.get("expire"), u.get("online_at"), u.get("note"), sub_link(p, u)])
     bot.send_document(chat, io.BytesIO(("\ufeff" + s.getvalue()).encode("utf-8")),
-                      visible_file_name=f"users-{stamp}.csv", caption="📤 خروجی CSV (قابل باز شدن در اکسل)")
+                      visible_file_name=f"users-{host(p).replace(':', '_')}-{stamp}.csv", caption=f"📤 خروجی CSV (قابل باز شدن در اکسل) — {host(p)}")
 
 
 def full_backup(p, chat):
@@ -2209,6 +2255,11 @@ def mig_log_save(entry):
         else:
             L.append(entry)
         _write(MGF, L[-100:])
+    if entry.get("undone"):
+        hub_event("migrate", f"↩️ مهاجرت <code>{entry['id']}</code> بازگردانی شد ({esc(entry.get('src'))} ← {esc(entry.get('dst'))})")
+    else:
+        hub_event("migrate", f"🔀 <b>مهاجرت</b> <code>{entry['id']}</code>\n{esc(entry.get('src'))} ← {esc(entry.get('dst'))}\n"
+                             f"✅ ساخته‌شده: {len(entry.get('created', []))} | ⏸ غیرفعال در مبدأ: {len(entry.get('disabled', []))}")
 
 
 def mig_menu_kb():
@@ -3252,6 +3303,8 @@ def route(act, a, msg, chat):
         return ch_route(act, a, msg, chat)
     if act == "ao":
         return ask_url(chat)
+    if act[:2] == "HB":
+        return hub_route(act, a, msg, chat)
     if act[:1] == "M":
         return mig_route(act, a, msg, chat)
     if act[:1] == "G":
@@ -3469,6 +3522,8 @@ def route(act, a, msg, chat):
         kb.add(B("✅ بله، حذف شود", callback_data=f"PDC:{pid}"), B("❌ نه", callback_data=f"p:{pid}"))
         edit(msg, "⚠️ پنل از ربات حذف شود؟ (از خود پنل چیزی پاک نمی‌شود)", kb)
     elif act == "PDC":
+        _hp = get_panel(pid)
+        hub_event("ops", f"🗑 پنل از ربات حذف شد: <b>{esc(host(_hp))}</b>" if _hp else "🗑 یک پنل از ربات حذف شد")
         save([x for x in load() if x["id"] != pid])
         trash_remove(pid)
         tokens.pop(pid, None)
@@ -3494,7 +3549,530 @@ def cb(c):
             pass
 
 
+# ================= report group hub (forum topics) =================
+# Sends reports / backups / alerts of ALL registered panels into 10 topics of a
+# Telegram forum group. Light on purpose (no extra dependencies) so it runs on Termux.
+HUBF = os.path.join(DATA_DIR, "hub.json")
+HUBQ = queue.Queue()
+HUB_ANON = 1087968824  # id used by Telegram for anonymous group admins
+HUB_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
+HUB_TOPICS = [
+    ("overview", "📊 گزارش کلی", "خلاصه‌ی آمار همه‌ی پنل‌ها (کاربران، آنلاین، مصرف، فروش). به‌صورت دوره‌ای ارسال می‌شود."),
+    ("charts", "📈 نمودارها", "داشبورد تصویری هر پنل (روند مصرف، پرمصرف‌ها، وضعیت، انقضا و ...)."),
+    ("backup", "💾 بکاپ پنل‌ها", "فایل ZIP بکاپ کامل هر پنل. ⚠️ حاوی اطلاعات حساس است؛ گروه را خصوصی نگه دار."),
+    ("users", "👥 خروجی کاربران", "خروجی JSON و CSV کاربران هر پنل."),
+    ("top", "🏆 پرمصرف‌ها", "پرمصرف‌ترین کاربران هر پنل در بازه‌ی گزارش."),
+    ("status", "🩺 وضعیت پنل‌ها", "سلامت و پاسخ‌گویی پنل‌ها؛ قطع و وصل شدن‌ها و خطاهای ارسال."),
+    ("alerts", "🔔 هشدارها", "کاربران نزدیک اتمام حجم و نزدیک انقضا."),
+    ("trash", "🗑 سطل زباله", "کاربرانی که با ربات حذف یا بازگردانی می‌شوند."),
+    ("migrate", "🔀 مهاجرت", "گزارش مهاجرت‌ها و بازگردانی آن‌ها."),
+    ("ops", "🛠 لاگ عملیات", "ساخت/ویرایش کاربر، ریست، ریوک ساب و افزودن/حذف پنل."),
+]
+HUB_JOBS = [("overview", "📊 گزارش کلی"), ("charts", "📈 نمودارها"), ("backup", "💾 بکاپ کامل"),
+            ("users", "👥 خروجی کاربران"), ("top", "🏆 پرمصرف‌ها"), ("status", "🩺 وضعیت پنل‌ها")]
+HUB_DEF = {"overview": 12, "charts": 24, "backup": 24, "users": 168, "top": 24, "status": 6}
+HUB_STEPS = [0, 6, 12, 24, 72, 168]
+FA_D = str.maketrans("0123456789", "۰۱۲۳۴۵۶۷۸۹")
+
+
+def hub_cfg():
+    return _read(HUBF, {})
+
+
+def hub_update(**kw):
+    with tlock:
+        h = _read(HUBF, {})
+        h.update(kw)
+        _write(HUBF, h)
+        return h
+
+
+def hub_ready():
+    h = hub_cfg()
+    return bool(h.get("chat_id") and h.get("topics") and h.get("enabled", True))
+
+
+def hub_every(h, job):
+    v = (h.get("sched") or {}).get(job, HUB_DEF[job])
+    return int(v or 0)
+
+
+def hub_every_label(hrs):
+    if not hrs:
+        return "خاموش"
+    if hrs % 24 == 0:
+        d = hrs // 24
+        return "هر روز" if d == 1 else f"هر {str(d).translate(FA_D)} روز"
+    return f"هر {str(hrs).translate(FA_D)} ساعت"
+
+
+def _hub_retry(fn, tries=3):
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            ra = None
+            try:
+                ra = ((getattr(e, "result_json", None) or {}).get("parameters") or {}).get("retry_after")
+            except Exception:
+                pass
+            if ra and i < tries - 1:
+                time.sleep(min(int(ra) + 1, 60))
+                continue
+            raise
+
+
+def _topic_gone(e):
+    s = str(e).lower()
+    return "thread not found" in s or "topic_id_invalid" in s or "topic_deleted" in s
+
+
+def hub_new_topic(chat_id, key):
+    meta = next(t for t in HUB_TOPICS if t[0] == key)
+    i = [t[0] for t in HUB_TOPICS].index(key)
+    t = bot.create_forum_topic(chat_id, tr(meta[1]), icon_color=HUB_COLORS[i % len(HUB_COLORS)])
+    return t.message_thread_id
+
+
+def hub_recreate(key):
+    h = hub_cfg()
+    tid = hub_new_topic(h["chat_id"], key)
+    topics = dict(h.get("topics") or {})
+    topics[key] = tid
+    hub_update(topics=topics)
+    return tid
+
+
+def hub_post(key, fn):
+    """Run fn(chat_id); every bot.send_* inside it lands in the topic `key`."""
+    h = hub_cfg()
+    cid, tid = h.get("chat_id"), (h.get("topics") or {}).get(key)
+    if not (cid and tid and h.get("enabled", True)):
+        return False
+    for attempt in (0, 1):
+        _TL.chat, _TL.tid = cid, tid
+        try:
+            _hub_retry(lambda: fn(cid))
+            return True
+        except Exception as e:
+            if attempt == 0 and _topic_gone(e):
+                tid = hub_recreate(key)
+                continue
+            if attempt == 0 and "topic_closed" in str(e).lower():
+                bot.reopen_forum_topic(cid, tid)
+                continue
+            raise
+        finally:
+            _TL.chat = _TL.tid = None
+    return False
+
+
+def hub_send_text(key, text):
+    chunks, cur = [], ""
+    for ln in text.split("\n"):
+        if len(cur) + len(ln) + 1 > 3800 and cur:
+            chunks.append(cur)
+            cur = ""
+        cur += ("\n" if cur else "") + ln
+    if cur:
+        chunks.append(cur)
+    for c in chunks:
+        hub_post(key, lambda cid, c=c: bot.send_message(cid, c, disable_web_page_preview=True))
+
+
+def hub_event(key, text):
+    """Queue a short message for a topic (sent by a background worker, never blocks the UI)."""
+    if not hub_ready() or HUBQ.qsize() > 300:
+        return
+    HUBQ.put((key, text))
+
+
+def hub_worker():
+    while True:
+        key, text = HUBQ.get()
+        batch, t0 = [text], time.time()
+        sep = "\n" if key in ("ops", "trash") else "\n\n"
+        while time.time() - t0 < 3 and sum(len(x) for x in batch) < 3000:
+            try:
+                k2, t2 = HUBQ.get(timeout=1)
+            except queue.Empty:
+                break
+            if k2 == key:
+                batch.append(t2)
+            else:
+                HUBQ.put((k2, t2))
+                break
+        try:
+            hub_send_text(key, sep.join(batch))
+        except Exception as e:
+            print("hub send failed:", e)
+        time.sleep(1.2)
+
+
+def notify(key, text):
+    """Alert: DM to the owner (unless muted while the hub is active) + copy to the hub topic."""
+    if not (hub_ready() and hub_cfg().get("dm_alerts") is False):
+        bot.send_message(OWNER, text)
+    hub_event(key, text)
+
+
+# ---------- setup ----------
+def hub_setup(chat_id):
+    """Bind the group, check permissions, create/verify the 10 topics. Returns (ok, text)."""
+    try:
+        c = bot.get_chat(chat_id)
+    except Exception as e:
+        return False, f"❌ به این گروه دسترسی ندارم:\n<code>{esc(e)[:200]}</code>"
+    head = f"🆔 آیدی گروه: <code>{chat_id}</code>\n"
+    if c.type != "supergroup" or not getattr(c, "is_forum", False):
+        return False, (head + "⚠️ گروه باید سوپرگروه با <b>Topics</b> فعال باشد.\n"
+                       "تنظیمات گروه ← Topics را روشن کن، بعد دوباره <code>/setup</code> بزن.")
+    try:
+        me = bot.get_me()
+        cm = bot.get_chat_member(chat_id, me.id)
+    except Exception as e:
+        return False, head + f"❌ وضعیتم در گروه معلوم نشد:\n<code>{esc(e)[:200]}</code>"
+    if cm.status not in ("administrator", "creator"):
+        return False, head + "⚠️ مرا ادمین گروه کن (با دسترسی Manage Topics)، بعد <code>/setup</code> بزن."
+    if cm.status == "administrator" and not getattr(cm, "can_manage_topics", False):
+        return False, head + "⚠️ دسترسی <b>Manage Topics</b> را برای من روشن کن، بعد <code>/setup</code> بزن."
+    h = hub_cfg()
+    same = h.get("chat_id") == chat_id
+    topics = dict(h.get("topics") or {}) if same else {}
+    made, fixed = [], []
+    for key, title, desc in HUB_TOPICS:
+        intro = f"{tr(title)}\n{tr(desc)}"
+        tid = topics.get(key)
+        if tid:
+            try:  # existence check by posting (also acts as a test message)
+                _m = bot.send_message(chat_id, "✅ " + tr("تاپیک فعال است."), message_thread_id=tid)
+                try:
+                    bot.delete_message(chat_id, _m.message_id)
+                except Exception:
+                    pass
+                continue
+            except Exception as e:
+                if not _topic_gone(e):
+                    return False, head + f"❌ خطا در تاپیک {tr(title)}:\n<code>{esc(e)[:200]}</code>"
+        try:
+            tid = hub_new_topic(chat_id, key)
+        except Exception as e:
+            hub_update(chat_id=chat_id, title=c.title, topics=topics)
+            return False, head + f"❌ ساخت تاپیک {tr(title)} ناموفق:\n<code>{esc(e)[:200]}</code>"
+        topics[key] = tid
+        (fixed if same and h.get("topics", {}).get(key) else made).append(key)
+        try:
+            bot.send_message(chat_id, intro, message_thread_id=tid)
+        except Exception:
+            pass
+        time.sleep(0.8)
+    now = int(time.time())
+    last = dict(h.get("last") or {}) if same else {}
+    for job, _ in HUB_JOBS:
+        last.setdefault(job, now)
+    hub_update(chat_id=chat_id, title=c.title, topics=topics, enabled=True, last=last,
+               dm_alerts=h.get("dm_alerts", True))
+    warn = ""
+    try:
+        n = bot.get_chat_member_count(chat_id)
+        if n > 2:
+            warn = f"\n⚠️ در گروه {n} عضو هست. بکاپ‌ها اطلاعات حساس دارند؛ بهتر است فقط خودت و ربات عضو باشید."
+    except Exception:
+        pass
+    msg = (head + f"✅ گروه «{esc(c.title)}» متصل شد.\n🧩 تاپیک‌ها: {len(topics)}/{len(HUB_TOPICS)}"
+           f" (جدید: {len(made)}، بازسازی‌شده: {len(fixed)})\n"
+           f"📡 پوشش: همه‌ی پنل‌های ثبت‌شده ({len(load())}) و پنل‌هایی که بعداً اضافه کنی، خودکار.{warn}")
+    return True, msg
+
+
+GROUP_TYPES = ("group", "supergroup")
+
+
+@bot.message_handler(commands=["setup", "hub", "id"], func=lambda m: m.chat.type in GROUP_TYPES)
+def hub_group_cmd(m):
+    uid = m.from_user.id if m.from_user else 0
+    if uid == HUB_ANON:
+        return bot.reply_to(m, "⚠️ حالت «ادمین ناشناس» روشن است؛ آن را خاموش کن و دوباره بفرست.")
+    if uid != OWNER:
+        return
+    cmd = (m.text or "").split()[0].split("@")[0].lower()
+    if cmd == "/id":
+        return bot.reply_to(m, f"🆔 <code>{m.chat.id}</code>")
+    ok, text = hub_setup(m.chat.id)
+    bot.reply_to(m, text)
+
+
+@bot.my_chat_member_handler()
+def hub_member(u):
+    try:
+        if u.chat.type not in GROUP_TYPES:
+            return
+        st = u.new_chat_member.status
+        mine = hub_cfg().get("chat_id") == u.chat.id
+        if st in ("left", "kicked"):
+            if mine:
+                hub_update(enabled=False)
+                bot.send_message(OWNER, f"⚠️ از گروه گزارش «{esc(u.chat.title)}» حذف شدم؛ ارسال به گروه متوقف شد.")
+            return
+        if st == "administrator" and u.from_user.id == OWNER and (not mine or u.old_chat_member.status != "administrator"):
+            ok, text = hub_setup(u.chat.id)
+            bot.send_message(OWNER, "🛰 <b>گروه گزارش</b>\n" + text)
+            try:
+                bot.send_message(u.chat.id, text)
+            except Exception:
+                pass
+    except Exception as e:
+        print("hub_member error:", e)
+
+
+# ---------- content builders ----------
+def hub_panel_text(p):
+    xs = X(p, True)
+    on = sum(1 for x in xs if x["online"])
+    act = sum(1 for x in xs if x["st"] == "active" and not x["expired"])
+    exp = sum(1 for x in xs if x["expired"])
+    used = sum(x["used"] for x in xs)
+    sold, left, unl = sold_stats(xs)
+    near = sum(1 for x in xs if FILT["near"][1](x))
+    soon = sum(1 for x in xs if FILT["soon"][1](x))
+    return (f"🌐 <b>{esc(host(p))}</b>\n"
+            f"   👥 {len(xs)} | ✅ فعال {act} | 🔵 آنلاین {on} | ⏳ منقضی {exp}\n"
+            f"   📈 مصرف {fmt_bytes(used)} | 💰 فروخته {fmt_bytes(sold)} | 🧮 مانده {fmt_bytes(left)}\n"
+            f"   ⚠️ نزدیک اتمام {near} | ⏰ نزدیک انقضا {soon}"), (len(xs), on, used, sold)
+
+
+def hub_overview_text(ps, days):
+    out = [f"📊 <b>گزارش دوره‌ای</b> — {time.strftime('%Y-%m-%d %H:%M')}\n"]
+    tot, ok, bad = [0, 0, 0, 0], 0, 0
+    for p in ps:
+        try:
+            t, v = hub_panel_text(p)
+            out.append(t)
+            tot = [a + b for a, b in zip(tot, v)]
+            ok += 1
+        except Exception as e:
+            out.append(f"🌐 <b>{esc(host(p))}</b>\n   ❌ {esc(e)[:120]}")
+            bad += 1
+    out.append(f"\n<b>جمع کل ({len(ps)} پنل)</b>: 👥 {tot[0]} | 🔵 {tot[1]} | 📈 {fmt_bytes(tot[2])} | 💰 {fmt_bytes(tot[3])}")
+    return "\n".join(out), ok, bad
+
+
+def hub_status_text(ps, days):
+    out = [f"🩺 <b>وضعیت پنل‌ها</b> — {time.strftime('%Y-%m-%d %H:%M')}\n"]
+    ok = bad = 0
+    for p in ps:
+        t0 = time.time()
+        d = first_ok(p, ["/api/system", "/api/admin"])
+        ms = int((time.time() - t0) * 1000)
+        if d is None:
+            try:
+                login(p)
+                d = {}
+            except Exception as e:
+                out.append(f"❌ <b>{esc(host(p))}</b> — {esc(e)[:120]}")
+                bad += 1
+                continue
+        extra = []
+        if isinstance(d, dict):
+            if d.get("version"):
+                extra.append(f"v{esc(d['version'])}")
+            if isinstance(d.get("cpu_usage"), (int, float)):
+                extra.append(f"CPU {d['cpu_usage']:.0f}%")
+            if d.get("mem_total"):
+                extra.append(f"RAM {fmt_bytes(d.get('mem_used') or 0)}/{fmt_bytes(d['mem_total'])}")
+            if d.get("online_users") is not None:
+                extra.append(f"آنلاین {d['online_users']}")
+        out.append(f"✅ <b>{esc(host(p))}</b> — {ms}ms" + (" | " + " | ".join(extra) if extra else ""))
+        ok += 1
+    return "\n".join(out), ok, bad
+
+
+def hub_top_text(ps, days):
+    rl = RANGE_L.get(days, RANGE_L[7])[0]
+    out = [f"🏆 <b>پرمصرف‌ترین‌ها</b> — {rl}\n"]
+    ok = bad = 0
+    for p in ps:
+        try:
+            xs = X(p, True)
+            top = top_users(p, days, xs)
+            rows = [r for r in top["rows"] if r[1] > 0][:10]
+            src = " (کل مصرف؛ تاریخچه کافی نیست)" if top["src"] == "alltime" else ""
+            out.append(f"🌐 <b>{esc(host(p))}</b>{src}")
+            out += [f"{i}. <code>{esc(n)}</code> — {fmt_bytes(v)}" for i, (n, v) in enumerate(rows, 1)] or ["—"]
+            out.append("")
+            ok += 1
+        except Exception as e:
+            out.append(f"🌐 <b>{esc(host(p))}</b>\n   ❌ {esc(e)[:120]}\n")
+            bad += 1
+    return "\n".join(out), ok, bad
+
+
+def hub_charts_one(p, cid, days):
+    if MPL:
+        D = chart_data(p, days)
+        bot.send_photo(cid, render_dashboard(D, CH_ORDER), caption=ch_caption(D, "\n🖼 گزارش مدیریتی"))
+    else:
+        bot.send_message(cid, hub_panel_text(p)[0] + "\n\n⚠️ matplotlib نصب نیست؛ فقط متن ارسال شد.")
+
+
+def hub_backup_one(p, cid, days):
+    full_backup(p, cid)
+
+
+def hub_users_one(p, cid, days):
+    export(p, cid)
+
+
+HUB_TEXT_JOBS = {"overview": hub_overview_text, "status": hub_status_text, "top": hub_top_text}
+HUB_FILE_JOBS = {"charts": hub_charts_one, "backup": hub_backup_one, "users": hub_users_one}
+
+
+def hub_run_job(job):
+    """Run one job for ALL registered panels. Returns (ok, bad)."""
+    ps = load()
+    if not ps:
+        return 0, 0
+    h = hub_cfg()
+    hrs = hub_every(h, job) or 24
+    days = 1 if hrs <= 12 else (7 if hrs <= 72 else 30)
+    hub_update(last={**(h.get("last") or {}), job: int(time.time())})
+    if job in HUB_TEXT_JOBS:
+        text, ok, bad = HUB_TEXT_JOBS[job](ps, days)
+        hub_send_text(job, text)
+        return ok, bad
+    ok = bad = 0
+    for p in ps:
+        try:
+            hub_post(job, lambda cid, p=p: HUB_FILE_JOBS[job](p, cid, days))
+            ok += 1
+        except Exception as e:
+            bad += 1
+            hub_event("status", f"❌ <b>{esc(dict(HUB_JOBS)[job])}</b> برای {esc(host(p))} ناموفق:\n<code>{esc(e)[:200]}</code>")
+        time.sleep(1.5)
+    return ok, bad
+
+
+def hub_loop():
+    time.sleep(45)
+    while True:
+        try:
+            if hub_ready():
+                h = hub_cfg()
+                for job, _ in HUB_JOBS:
+                    hrs = hub_every(h, job)
+                    if hrs and time.time() - (h.get("last") or {}).get(job, 0) >= hrs * 3600:
+                        hub_run_job(job)
+        except Exception as e:
+            print("hub_loop error:", e)
+        time.sleep(60)
+
+
+# ---------- private-chat menu ----------
+def hub_menu(chat, msg):
+    h = hub_cfg()
+    ok = bool(h.get("chat_id") and h.get("topics"))
+    kb = types.InlineKeyboardMarkup(row_width=1)
+    if not ok:
+        text = ("🛰 <b>گروه گزارش</b>\n\n"
+                "گزارش، بکاپ، نمودار و هشدار <b>همه‌ی پنل‌ها</b> در ۱۰ تاپیک یک گروه جمع می‌شود.\n\n"
+                "۱) یک گروه بساز و در تنظیماتش <b>Topics</b> را روشن کن.\n"
+                "۲) ربات را به گروه اضافه کن و <b>ادمین</b> کن (با دسترسی Manage Topics).\n"
+                "۳) همان لحظه آیدی گروه را می‌گیرد و تاپیک‌ها را می‌سازد. اگر نشد داخل گروه "
+                "<code>/setup</code> بفرست، یا آیدی را از پایین دستی ثبت کن.")
+    else:
+        sched = "\n".join(f"   {lbl}: {hub_every_label(hub_every(h, j))}" for j, lbl in HUB_JOBS)
+        text = (f"🛰 <b>گروه گزارش</b>\n\n"
+                f"وضعیت: {'✅ فعال' if h.get('enabled', True) else '⏸ متوقف'}\n"
+                f"گروه: <b>{esc(h.get('title', ''))}</b>\n🆔 <code>{h['chat_id']}</code>\n"
+                f"🧩 تاپیک‌ها: {len(h['topics'])}/{len(HUB_TOPICS)}\n"
+                f"📡 پنل‌های تحت پوشش: {len(load())} (همه، خودکار)\n\n"
+                f"⏱ <b>زمان‌بندی</b>\n{sched}\n\n"
+                f"🔔 هشدار در پیوی هم: {'روشن' if h.get('dm_alerts', True) else 'خاموش'}")
+        kb.add(B("📤 ارسال همین الان", callback_data="HBn"), B("⏱ زمان‌بندی", callback_data="HBc"))
+        kb.add(B("🔧 بازبینی / ساخت دوباره‌ی تاپیک‌ها", callback_data="HBr"))
+        kb.add(B(f"🔔 هشدار در پیوی: {'خاموش کن' if h.get('dm_alerts', True) else 'روشن کن'}", callback_data="HBd"))
+        kb.add(B("⏸ توقف" if h.get("enabled", True) else "▶️ فعال‌سازی", callback_data="HBe"))
+    kb.add(B("🆔 ثبت دستی آیدی گروه", callback_data="HBm"))
+    if ok:
+        kb.add(B("🗑 قطع اتصال", callback_data="HBx"))
+    kb.add(B("🏠 منو", callback_data="m"))
+    edit(msg, text, kb)
+
+
+def hub_route(act, a, msg, chat):
+    bg = lambda fn: threading.Thread(target=lambda: _safe(chat, fn), daemon=True).start()
+    h = hub_cfg()
+    back = back_kb("HB", "🔙 گروه گزارش")
+    if act == "HB":
+        ST.pop(chat, None)
+        return hub_menu(chat, msg)
+    if act == "HBm":
+        ST[chat] = {"step": "hub_id"}
+        return prompt(chat, "🆔 آیدی عددی گروه را بفرست (مثل <code>-1001234567890</code>).\n"
+                            "راحت‌ترین راه: داخل گروه بنویس <code>/id</code> یا <code>/setup</code>.")
+    if act == "HBd":
+        hub_update(dm_alerts=not h.get("dm_alerts", True))
+        return hub_menu(chat, msg)
+    if act == "HBe":
+        hub_update(enabled=not h.get("enabled", True))
+        return hub_menu(chat, msg)
+    if act == "HBx":
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(B("✅ بله، قطع کن", callback_data="HBxc"), B("🔙 برگشت", callback_data="HB"))
+        return edit(msg, "⚠️ اتصال به گروه قطع شود؟ (تاپیک‌ها و پیام‌ها در گروه می‌مانند)", kb)
+    if act == "HBxc":
+        hub_update(chat_id=None, topics={}, title="")
+        return hub_menu(chat, msg)
+    if not (h.get("chat_id") and h.get("topics")):
+        return hub_menu(chat, msg)
+    if act == "HBr":
+        edit(msg, "⏳ در حال بازبینی تاپیک‌ها...")
+
+        def run():
+            ok, text = hub_setup(h["chat_id"])
+            edit(msg, "🔧 " + text, back)
+        return bg(run)
+    if act == "HBc":
+        if len(a) > 1 and a[1] in dict(HUB_JOBS):
+            cur = hub_every(h, a[1])
+            nxt = HUB_STEPS[(HUB_STEPS.index(cur) + 1) % len(HUB_STEPS)] if cur in HUB_STEPS else HUB_STEPS[1]
+            sch = dict(h.get("sched") or {})
+            sch[a[1]] = nxt
+            h = hub_update(sched=sch)
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for j, lbl in HUB_JOBS:
+            kb.add(B(f"{lbl}: {hub_every_label(hub_every(h, j))}", callback_data=f"HBc:{j}"))
+        kb.add(B("🔙 گروه گزارش", callback_data="HB"))
+        return edit(msg, "⏱ <b>زمان‌بندی ارسال خودکار</b>\nروی هر مورد بزن تا بازه عوض شود "
+                         "(خاموش ← ۶ساعت ← ۱۲ساعت ← روزانه ← ۳روز ← هفتگی).\n"
+                         "نمودار/پرمصرف‌ها: بازه‌ی ≤۱۲ساعت = ۲۴ساعت اخیر، ≤۳روز = ۷ روز، هفتگی = ۳۰ روز.", kb)
+    if act == "HBn":
+        if len(a) > 1:
+            jobs = [j for j, _ in HUB_JOBS] if a[1] == "all" else [a[1]]
+            if any(j not in dict(HUB_JOBS) for j in jobs):
+                return
+            if not h.get("enabled", True):
+                return edit(msg, "⏸ ارسال به گروه متوقف است. اول از منوی گروه گزارش «▶️ فعال‌سازی» را بزن.", back)
+            edit(msg, "⏳ در حال ارسال به گروه... (برای بکاپ و نمودار ممکن است چند دقیقه طول بکشد)")
+
+            def run():
+                res = []
+                for j in jobs:
+                    ok, bad = hub_run_job(j)
+                    res.append(f"{dict(HUB_JOBS)[j]}: ✅ {ok}" + (f" | ❌ {bad}" if bad else ""))
+                edit(msg, "✅ <b>ارسال شد</b>\n\n" + "\n".join(res), back_kb("HBn", "🔙 ارسال"))
+            return bg(run)
+        kb = types.InlineKeyboardMarkup(row_width=2)
+        kb.add(*[B(lbl, callback_data=f"HBn:{j}") for j, lbl in HUB_JOBS])
+        kb.add(B("🚀 همه‌ی موارد", callback_data="HBn:all"))
+        kb.add(B("🔙 گروه گزارش", callback_data="HB"))
+        return edit(msg, f"📤 <b>ارسال همین الان</b>\nبرای همه‌ی {len(load())} پنل در تاپیک مربوطه ارسال می‌شود:", kb)
+
+
 # ================= auto alerts =================
+_DOWN = set()
+
+
 def alert_loop():
     sent = set()
     time.sleep(60)
@@ -3511,8 +4089,12 @@ def alert_loop():
                         k = (p["id"], "down", today)
                         if k not in sent:
                             sent.add(k)
-                            bot.send_message(OWNER, f"🚨 پنل <b>{esc(host(p))}</b> در دسترس نیست:\n<code>{esc(e)[:200]}</code>")
+                            _DOWN.add(p["id"])
+                            notify("status", f"🚨 پنل <b>{esc(host(p))}</b> در دسترس نیست:\n<code>{esc(e)[:200]}</code>")
                         continue
+                    if p["id"] in _DOWN:
+                        _DOWN.discard(p["id"])
+                        notify("status", f"✅ پنل <b>{esc(host(p))}</b> دوباره در دسترس است.")
                     groups = [
                         ("📉 نزدیک اتمام حجم (۹۰٪+)", "near",
                          [x for x in xs if x["st"] == "active" and x["lim"] and x["ratio"] >= 0.9]),
@@ -3527,7 +4109,7 @@ def alert_loop():
                             sent.add((p["id"], kind, x["name"], today))
                         body = "\n".join(line(i, x, kind) for i, x in enumerate(new[:15], 1))
                         more = f"\n… و {len(new) - 15} مورد دیگر" if len(new) > 15 else ""
-                        bot.send_message(OWNER, f"🔔 <b>{esc(host(p))}</b>\n{title}: {len(new)}\n\n{body}{more}")
+                        notify("alerts", f"🔔 <b>{esc(host(p))}</b>\n{title}: {len(new)}\n\n{body}{more}")
         except Exception:
             pass
         time.sleep(1800)
@@ -3536,5 +4118,8 @@ def alert_loop():
 if __name__ == "__main__":
     threading.Thread(target=alert_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()
+    threading.Thread(target=hub_loop, daemon=True).start()
+    threading.Thread(target=hub_worker, daemon=True).start()
     print("Bot is running...")
-    bot.infinity_polling(skip_pending=True, timeout=30)
+    bot.infinity_polling(skip_pending=True, timeout=30,
+                         allowed_updates=["message", "callback_query", "my_chat_member"])

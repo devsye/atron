@@ -4,18 +4,15 @@
   <p><strong>PasarGuard Panel Manager — Telegram Bot</strong></p>
 </div>
 
-
-**PasarGuard Panel Manager — Telegram Bot**
-
 [فارسی](#فارسی) · [English](#english)
 
 ---
 
 ## فارسی
 
-ربات تلگرامی برای مدیریت یک یا چند پنل **PasarGuard** با دکمه‌های شیشه‌ای (inline): مدیریت کاربران، جستجو، آمار و نمودار مصرف، سطل زباله (بازیابی تا ۷ روز)، بکاپ، هشدارها، انتقال بین پنل‌ها و رابط دو‌زبانه (فارسی/انگلیسی).
+ربات تلگرامی برای مدیریت یک یا چند پنل **PasarGuard** با دکمه‌های شیشه‌ای (inline): مدیریت کاربران، جستجو، آمار و نمودار مصرف، سطل زباله (بازیابی تا ۷ روز)، بکاپ، هشدارها، انتقال بین پنل‌ها، **گروه گزارش** (جدید) و رابط دو‌زبانه (فارسی/انگلیسی).
 
-> 🚧 **نسخه ۱.۰ (اولین نسخه‌ی عمومی)** — این پروژه تازه شروع شده و آپدیت‌های زیادی در راه است. باگ‌ها را در Issues گزارش دهید و ریپو را Star/Watch کنید تا از نسخه‌های بعدی باخبر شوید.
+> 🚧 **نسخه ۱.۱** — این پروژه تازه شروع شده و آپدیت‌های زیادی در راه است. باگ‌ها را در Issues گزارش دهید و ریپو را Star/Watch کنید تا از نسخه‌های بعدی باخبر شوید.
 >
 > توسعه‌دهنده: **SYE** ([github.com/devsye](https://github.com/devsye))
 
@@ -73,6 +70,18 @@ bash scripts/termux-install.sh
 | `CHART_LANG` | زبان برچسب نمودارها: `en` یا `fa` |
 | `DATA_DIR` | مسیر ذخیره داده‌ها (پیش‌فرض `./data`) |
 
+### 🛰 گروه گزارش (جدید در ۱.۱)
+
+گزارش، نمودار، بکاپ و هشدار **همه‌ی پنل‌ها** در ۱۰ تاپیک یک گروه تلگرام جمع می‌شود:
+
+1. یک گروه بسازید و در تنظیماتش **Topics** را روشن کنید.
+2. ربات را به گروه اضافه و **ادمین** کنید (با دسترسی **Manage Topics**؛ حالت «ادمین ناشناس» خاموش باشد).
+3. ربات آیدی گروه را خودکار می‌گیرد و تاپیک‌ها را می‌سازد. اگر نشد، داخل گروه `/setup` بفرستید یا از منوی «🛰 گروه گزارش» آیدی را دستی ثبت کنید.
+
+تاپیک‌ها: گزارش کلی، نمودارها، بکاپ، خروجی کاربران، پرمصرف‌ها، وضعیت پنل‌ها، هشدارها، سطل زباله، مهاجرت و لاگ عملیات. زمان‌بندی هر مورد جدا تنظیم می‌شود (خاموش / ۶ساعت / ۱۲ساعت / روزانه / ۳روز / هفتگی) و دکمه‌ی «ارسال همین الان» هم دارد.
+
+> ⚠️ فایل‌های بکاپ حاوی اطلاعات حساس‌اند؛ گروه را **خصوصی** نگه دارید و فقط خودتان و ربات عضو باشید.
+
 ### نکات امنیتی
 
 - فایل `.env` را هرگز commit نکنید (در `.gitignore` هست). اگر توکن لو رفت، در BotFather با `/revoke` عوض کنید.
@@ -96,9 +105,9 @@ Issue و Pull Request خوشحال‌مان می‌کند. لطفاً هیچ‌�
 
 ## English
 
-A Telegram bot to manage one or more **PasarGuard** panels through inline buttons: user management, search, usage stats and charts, trash with 7‑day restore, backups, alerts, migration between panels, and a bilingual (Persian/English) UI.
+A Telegram bot to manage one or more **PasarGuard** panels through inline buttons: user management, search, usage stats and charts, trash with 7‑day restore, backups, alerts, migration between panels, a **report group hub** (new), and a bilingual (Persian/English) UI.
 
-> 🚧 **v1.0 — first public release.** This project is just getting started and many updates are coming. Report bugs in Issues, and Star/Watch the repo to follow new versions.
+> 🚧 **v1.1.** This project is just getting started and many updates are coming. Report bugs in Issues, and Star/Watch the repo to follow new versions.
 >
 > Developed by **SYE** ([github.com/devsye](https://github.com/devsye))
 
@@ -150,6 +159,18 @@ bash scripts/termux-install.sh
 | `ADMIN_ID` | Numeric Telegram ID of the owner (required) |
 | `CHART_LANG` | Chart label language: `en` or `fa` |
 | `DATA_DIR` | Data directory (default `./data`) |
+
+### 🛰 Report group hub (new in 1.1)
+
+Reports, charts, backups and alerts of **all panels** are collected in 10 topics of one Telegram group:
+
+1. Create a group and enable **Topics** in its settings.
+2. Add the bot and make it **admin** (with **Manage Topics**; turn off "anonymous admin").
+3. The bot picks up the group ID automatically and creates the topics. If it doesn't, send `/setup` in the group or set the ID manually from the "🛰 Report group" menu.
+
+Topics: overview, charts, backups, users export, top users, panel status, alerts, trash, migration, operations log. Each job has its own schedule (off / 6h / 12h / daily / 3 days / weekly) plus a "Send now" button.
+
+> ⚠️ Backup files contain sensitive data. Keep the group **private**, with only you and the bot as members.
 
 ### Security notes
 
